@@ -24,6 +24,7 @@ parser.add_argument('--adam_lr', type=float, default=0.0022) # adam lr for misc 
 parser.add_argument('--emb_scale', type=float, default=2.0) # rescale embedding to boost its adam lr
 parser.add_argument('--device_bsz', type=int, default=32) # have to use 32 instead of 64, due to strange pytorch VRAM issue
 parser.add_argument('--bsz', type=int, default=8*64)
+parser.add_argument('--wind_cuda', action=argparse.BooleanOptionalAction) # much faster cuda (!!! experimental !!!)
 cmd_args = parser.parse_args()
 
 '''
@@ -36,12 +37,7 @@ Changes:
 *) use Adam for misc weights (lora, time, etc.)
 
 Note:
-Currently runs at 20% GPT speed due to:
-
-*) Very inefficient RWKV-7 kernel.
-There is an efficient RWKV-7 kernel:
-https://github.com/johanwind/wind-rwkv7/tree/main
-Please test for numerical or precision issues.
+Currently runs at 50% GPT speed (when using --wind_cuda) due to:
 
 *) Strangely, takes more VRAM, so I have to reduce device_bsz to 32. I have some theory:
 1. Maybe current method of allocating tensor within custom op is suboptimal.
@@ -58,74 +54,118 @@ I think we can get it to 85% GPT speed @ ctxlen 1024 (can be faster than GPT @ c
 HEAD_SIZE = cmd_args.headsz
 sequence_length = 1024
 
-DTYPE = torch.bfloat16
-XTYPE = torch.float
-T = sequence_length
-CHUNK_LEN = 16
-
 from torch.utils.cpp_extension import load
-load(name="wkv7g", sources=["rwkv_cuda/wkv7g_op.cpp", f"rwkv_cuda/wkv7g_v1.cu"], is_python_module=False,
-                    verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}", f"-D_T_={T}", f"-D_CHUNK_LEN_={CHUNK_LEN}"])
-class WKV_7g(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, r, w, k, v, a, b):
-        with torch.no_grad():
-            B, T, C = r.size()
-            H = C // HEAD_SIZE
-            N = HEAD_SIZE
-            A = T // CHUNK_LEN
-            assert HEAD_SIZE == C // H
-            assert T % CHUNK_LEN == 0
-            assert r.dtype == DTYPE
-            assert w.dtype == DTYPE
-            assert k.dtype == DTYPE
-            assert v.dtype == DTYPE
-            assert a.dtype == DTYPE
-            assert b.dtype == DTYPE
-            assert r.is_contiguous()
-            assert w.is_contiguous()
-            assert k.is_contiguous()
-            assert v.is_contiguous()
-            assert a.is_contiguous()
-            assert b.is_contiguous()
-            ctx.B = B
-            ctx.T = T
-            ctx.C = C
-            ctx.H = H
-            y = torch.empty((B, T, C), device=k.device, dtype=DTYPE, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            saa = torch.empty((B, T, H, N), device=k.device, dtype=torch.float, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            sss = torch.empty((B, H, A, N, N), device=k.device, dtype=torch.float, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            torch.ops.wkv7g.forward(B, T, C, H, r, w, k, v, a, b, y, saa, sss)
-            ctx.save_for_backward(r, w, k, v, a, b, saa, sss)
-            return y
-    @staticmethod
-    def backward(ctx, gy):
-        with torch.no_grad():
-            N = HEAD_SIZE
-            B = ctx.B
-            T = ctx.T
-            C = ctx.C
-            H = ctx.H
-            A = T // CHUNK_LEN
-            assert gy.dtype == DTYPE
-            assert gy.is_contiguous()
-            r, w, k, v, a, b, saa, sss = ctx.saved_tensors
-            gr = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.zero_()#.uniform_(-100, 100)
-            gw = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.zero_()#.uniform_(-100, 100)
-            gk = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.zero_()#.uniform_(-100, 100)
-            gv = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.zero_()#.uniform_(-100, 100)
-            ga = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            gb = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            zzz = torch.empty((B, H, A-1, N, N), device=gy.device, dtype=XTYPE, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            torch.ops.wkv7g.backward(B, T, C, H, r, w, k, v, a, b, saa, sss, zzz, gy, gr, gw, gk, gv, ga, gb)
-            del saa
-            del sss
-            del zzz
-            return (gr, gw, gk, gv, ga, gb)
-def RUN_CUDA_RWKV7g(r, w, k, v, a, b):
-    return WKV_7g.apply(r, w, k, v, a, b)
 
-RUN_CUDA_RWKV7g = torch.compiler.disable(RUN_CUDA_RWKV7g)
+if not cmd_args.wind_cuda:
+
+    DTYPE = torch.bfloat16
+    XTYPE = torch.float
+    T = sequence_length
+    CHUNK_LEN = 16
+
+    load(name="wkv7g", sources=["rwkv_cuda/wkv7g_op.cpp", f"rwkv_cuda/wkv7g_v1.cu"], is_python_module=False,
+                        verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}", f"-D_T_={T}", f"-D_CHUNK_LEN_={CHUNK_LEN}"])
+    class WKV_7g(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, r, w, k, v, a, b):
+            with torch.no_grad():
+                B, T, C = r.size()
+                H = C // HEAD_SIZE
+                N = HEAD_SIZE
+                A = T // CHUNK_LEN
+                assert HEAD_SIZE == C // H
+                assert T % CHUNK_LEN == 0
+                assert r.dtype == DTYPE
+                assert w.dtype == DTYPE
+                assert k.dtype == DTYPE
+                assert v.dtype == DTYPE
+                assert a.dtype == DTYPE
+                assert b.dtype == DTYPE
+                assert r.is_contiguous()
+                assert w.is_contiguous()
+                assert k.is_contiguous()
+                assert v.is_contiguous()
+                assert a.is_contiguous()
+                assert b.is_contiguous()
+                ctx.B = B
+                ctx.T = T
+                ctx.C = C
+                ctx.H = H
+                y = torch.empty((B, T, C), device=k.device, dtype=DTYPE, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                saa = torch.empty((B, T, H, N), device=k.device, dtype=torch.float, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                sss = torch.empty((B, H, A, N, N), device=k.device, dtype=torch.float, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                torch.ops.wkv7g.forward(B, T, C, H, r, w, k, v, a, b, y, saa, sss)
+                ctx.save_for_backward(r, w, k, v, a, b, saa, sss)
+                return y
+        @staticmethod
+        def backward(ctx, gy):
+            with torch.no_grad():
+                N = HEAD_SIZE
+                B = ctx.B
+                T = ctx.T
+                C = ctx.C
+                H = ctx.H
+                A = T // CHUNK_LEN
+                assert gy.dtype == DTYPE
+                assert gy.is_contiguous()
+                r, w, k, v, a, b, saa, sss = ctx.saved_tensors
+                gr = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.zero_()#.uniform_(-100, 100)
+                gw = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.zero_()#.uniform_(-100, 100)
+                gk = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.zero_()#.uniform_(-100, 100)
+                gv = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.zero_()#.uniform_(-100, 100)
+                ga = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                gb = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                zzz = torch.empty((B, H, A-1, N, N), device=gy.device, dtype=XTYPE, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                torch.ops.wkv7g.backward(B, T, C, H, r, w, k, v, a, b, saa, sss, zzz, gy, gr, gw, gk, gv, ga, gb)
+                del saa
+                del sss
+                del zzz
+                return (gr, gw, gk, gv, ga, gb)
+    def RUN_CUDA_RWKV7g(r, w, k, v, a, b):
+        return WKV_7g.apply(r, w, k, v, a, b)
+
+    RUN_CUDA_RWKV7g = torch.compiler.disable(RUN_CUDA_RWKV7g)
+
+else:
+
+    assert cmd_args.headsz == 64 # only for headsz 64
+
+    class WindRWKV7(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, w,q,k,v,a,b,s0):
+            B,T,H,C = w.shape
+            ctx.s0_is_None = s0 is None
+            s0 = torch.zeros(B,H,C,C, dtype=w.dtype,device=w.device) if s0 is None else s0
+            assert T%16 == 0
+            assert all(i.dtype==torch.bfloat16 for i in [w,q,k,v,a,b,s0])
+            assert all(i.is_contiguous() for i in [w,q,k,v,a,b,s0])
+            y = torch.empty_like(v)
+            sT = torch.empty_like(s0)
+            s = torch.zeros(B,H,T//16,C,C, dtype=w.dtype,device=w.device)
+            torch.ops.wind.forward(w,q,k,v,a,b, s0,y,s,sT)
+            ctx.save_for_backward(w,q,k,v,a,b,s)
+            return y, sT
+        @staticmethod
+        def backward(ctx, dy, dsT):
+            assert all(i.dtype==torch.bfloat16 for i in [dy,dsT])
+            assert all(i.is_contiguous() for i in [dy,dsT])
+            w,q,k,v,a,b,s = ctx.saved_tensors
+            dw,dq,dk,dv,da,db,ds0 = [torch.empty_like(x) for x in [w,q,k,v,a,b,dsT]]
+            torch.ops.wind.backward(w,q,k,v,a,b, dy,s,dsT, dw,dq,dk,dv,da,db,ds0)
+            return dw,dq,dk,dv,da,db,(None if ctx.s0_is_None else ds0) 
+    wind_rwkv7 = WindRWKV7.apply
+
+    @torch.compile
+    def wind(w,q,k,v,a,b, s0=None, return_state = False, path = ''):
+        if not 'wind' in dir(torch.ops):
+            B,T,H,C = w.shape
+            load(name="wind", sources=[path+'wind_rwkv7.cu', path+'wind_rwkv7.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=[f'-D_C_={C}',"-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"])
+        return wind_rwkv7(w,q,k,v,a,b,s0)[:return_state+1]
+
+    def RUN_CUDA_RWKV7g(q, w, k, v, a, b):
+        B,T,HC = q.shape
+        q,w,k,v,a,b = [i.view(B,T,HC//HEAD_SIZE,HEAD_SIZE) for i in [q,w,k,v,a,b]]
+        return wind(w,q,k,v,a,b, path='rwkv_cuda_wind/')[0].view(B,T,HC)    
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -613,9 +653,10 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 # begin logging
 if master_process:
     run_id = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
+    run_prefix = 'v7wind' if cmd_args.wind_cuda else 'v7'
     wandb.init(
         project='fast-nanogpt',
-        name=f'v7 {cmd_args.adam_lr}/{cmd_args.emb_scale} {run_id}',
+        name=f'{run_prefix} {cmd_args.adam_lr}/{cmd_args.emb_scale} {run_id}',
         config=args,
         save_code=False,
     )
