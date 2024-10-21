@@ -1,4 +1,30 @@
-# Modded-NanoGPT
+# Modded-NanoGPT-RWKV
+
+RWKV Discord: https://discord.gg/bDSBUMeFpc
+
+RWKV Twitter: https://twitter.com/BlinkDL_AI
+
+## RWKV-6 and RWKV-7
+
+Modded-GPT 123.6M headsize 128 => val_loss 3.27xx
+
+RWKV-7 123.7M headsize 64 => val_loss 3.2715 (increase headsize to reach 3.26xx)
+
+RWKV-6 123.7M headsize 64 => val_loss 3.2914
+
+RWKV-6 123.7M headsize 192 => val_loss 3.28xx
+
+```
+Note: Currently very inefficient implementation. Please help if you are a Pytorch / CUDA master :)
+
+./run_rwkv7.sh --adam_lr 0.0022 --emb_scale 2 --muon_lr 0.00036 --headsz 64 --bsz 512 --device_bsz 32
+
+./run_rwkv6.sh --adam_lr 0.0022 --emb_scale 2 --muon_lr 0.00036 --headsz 64 --bsz 512 --device_bsz 32
+
+Try 0.0020/0.0022/0.0024 for adam_lr. Try 1.5/2/2.5 for emb_scale. Reduce device_bsz if OOM (will gradient accumulate).
+```
+
+## Original Readme
 
 This is a fast variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
