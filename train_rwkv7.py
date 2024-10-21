@@ -24,7 +24,7 @@ parser.add_argument('--adam_lr', type=float, default=0.0022) # adam lr for misc 
 parser.add_argument('--emb_scale', type=float, default=2.0) # rescale embedding to boost its adam lr
 parser.add_argument('--device_bsz', type=int, default=32) # have to use 32 instead of 64, due to strange pytorch VRAM issue
 parser.add_argument('--bsz', type=int, default=8*64)
-parser.add_argument('--wind_cuda', action=argparse.BooleanOptionalAction) # much faster cuda (!!! experimental !!!)
+parser.add_argument('--wind_cuda', action=argparse.BooleanOptionalAction) # much faster cuda (experimental, slightly worse loss)
 cmd_args = parser.parse_args()
 
 '''
