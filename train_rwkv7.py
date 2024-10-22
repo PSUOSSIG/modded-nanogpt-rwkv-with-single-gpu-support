@@ -661,7 +661,7 @@ if master_process:
     run_id = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
     run_prefix = 'v7wind' if cmd_args.wind_cuda else 'v7'
     if cmd_args.random_seed != -1:
-        run_prefix += ' seed{cmd_args.random_seed}'
+        run_prefix += f' seed{cmd_args.random_seed}'
     wandb.init(
         project='fast-nanogpt',
         name=f'{run_prefix} {cmd_args.adam_lr}/{cmd_args.emb_scale} {run_id}',
