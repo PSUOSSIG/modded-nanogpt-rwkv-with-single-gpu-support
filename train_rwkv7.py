@@ -4,7 +4,7 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import glob
-import time, datetime
+import time, datetime, random
 from dataclasses import dataclass
 
 import numpy as np
@@ -25,7 +25,14 @@ parser.add_argument('--emb_scale', type=float, default=2.0) # rescale embedding 
 parser.add_argument('--device_bsz', type=int, default=32) # have to use 32 instead of 64, due to strange pytorch VRAM issue
 parser.add_argument('--bsz', type=int, default=8*64)
 parser.add_argument('--wind_cuda', action=argparse.BooleanOptionalAction) # much faster cuda (experimental, slightly worse loss)
+parser.add_argument('--random_seed', type=int, default=-1)
 cmd_args = parser.parse_args()
+
+if cmd_args.random_seed != -1:
+    random.seed(cmd_args.random_seed)
+    np.random.seed(cmd_args.random_seed)
+    torch.manual_seed(cmd_args.random_seed)
+    torch.cuda.manual_seed_all(cmd_args.random_seed)
 
 '''
 Based on the GPT code in "101424_ModernArch" folder (please diff it to see the changes)
@@ -121,10 +128,9 @@ if not cmd_args.wind_cuda:
                 del sss
                 del zzz
                 return (gr, gw, gk, gv, ga, gb)
+    @torch.compiler.disable
     def RUN_CUDA_RWKV7g(r, w, k, v, a, b):
         return WKV_7g.apply(r, w, k, v, a, b)
-
-    RUN_CUDA_RWKV7g = torch.compiler.disable(RUN_CUDA_RWKV7g)
 
 else:
 
@@ -654,6 +660,8 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 if master_process:
     run_id = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
     run_prefix = 'v7wind' if cmd_args.wind_cuda else 'v7'
+    if cmd_args.random_seed != -1:
+        run_prefix += ' seed{cmd_args.random_seed}'
     wandb.init(
         project='fast-nanogpt',
         name=f'{run_prefix} {cmd_args.adam_lr}/{cmd_args.emb_scale} {run_id}',

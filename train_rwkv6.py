@@ -4,7 +4,7 @@ with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import glob
-import time, datetime
+import time, datetime, random
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,7 +24,15 @@ parser.add_argument('--adam_lr', type=float, default=0.0022) # adam lr for misc 
 parser.add_argument('--emb_scale', type=float, default=2.0) # rescale embedding to boost its adam lr
 parser.add_argument('--device_bsz', type=int, default=32) # have to use 32 instead of 64, due to strange pytorch VRAM issue
 parser.add_argument('--bsz', type=int, default=8*64)
+parser.add_argument('--fla_cuda', action=argparse.BooleanOptionalAction) # alternate cuda (experimental) (pip install --upgrade triton rwkv-fla)
+parser.add_argument('--random_seed', type=int, default=-1)
 cmd_args = parser.parse_args()
+
+if cmd_args.random_seed != -1:
+    random.seed(cmd_args.random_seed)
+    np.random.seed(cmd_args.random_seed)
+    torch.manual_seed(cmd_args.random_seed)
+    torch.cuda.manual_seed_all(cmd_args.random_seed)
 
 '''
 Based on the GPT code in "101424_ModernArch" folder (please diff it to see the changes)
@@ -39,11 +47,6 @@ Note:
 Currently runs at 50% GPT speed due to:
 
 *) Inefficient RWKV-6 kernel.
-There are more efficient RWKV-6 kernels such as:
-https://pypi.org/project/rwkv-fla/
-https://github.com/TorchRWKV/flash-linear-attention/tree/rwkv7/fla/ops/rwkv6
-https://github.com/sustcsonglin/flash-linear-attention/tree/main/fla/ops/rwkv6
-Please test for numerical or precision issues.
 
 *) Strangely, takes more VRAM, so I have to reduce device_bsz to 32. I have some theory:
 1. Maybe current method of allocating tensor within custom op is suboptimal.
@@ -59,59 +62,79 @@ I think we can get it to 90% GPT speed @ ctxlen 1024 (can be faster than GPT @ c
 
 HEAD_SIZE = cmd_args.headsz
 sequence_length = 1024
-from torch.utils.cpp_extension import load
-load(name="wkv6", sources=["rwkv_cuda/wkv6_op.cpp", f"rwkv_cuda/wkv6_cuda.cu"], is_python_module=False,
-                verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}", f"-D_T_={sequence_length}"])
+
+if not cmd_args.fla_cuda:
+    from torch.utils.cpp_extension import load
+    load(name="wkv6", sources=["rwkv_cuda/wkv6_op.cpp", f"rwkv_cuda/wkv6_cuda.cu"], is_python_module=False,
+                    verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}", f"-D_T_={sequence_length}"])
+        
+    class WKV_6(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, r, k, v, w, u):
+            with torch.no_grad():
+                B, T, C = r.size()
+                H = C // HEAD_SIZE
+                assert C % HEAD_SIZE == 0
+                assert r.dtype == torch.bfloat16
+                assert k.dtype == torch.bfloat16
+                assert v.dtype == torch.bfloat16
+                assert w.dtype == torch.bfloat16
+                assert u.dtype == torch.bfloat16
+                ctx.B = B
+                ctx.T = T
+                ctx.C = C
+                ctx.H = H
+                assert r.is_contiguous()
+                assert k.is_contiguous()
+                assert v.is_contiguous()
+                assert w.is_contiguous()
+                assert u.is_contiguous()
+                ctx.save_for_backward(r, k, v, w, u)
+                y = torch.empty((B, T, C), device=r.device, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                torch.ops.wkv6.forward(B, T, C, H, r, k, v, w, u, y)
+                return y
+
+        @staticmethod
+        def backward(ctx, gy):
+            with torch.no_grad():
+                assert gy.dtype == torch.bfloat16
+                B = ctx.B
+                T = ctx.T
+                C = ctx.C
+                H = ctx.H
+                assert gy.is_contiguous()
+                r, k, v, w, u = ctx.saved_tensors
+                gr = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                gk = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                gv = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                gw = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                gu = torch.empty((B, C), device=gy.device, requires_grad=False, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
+                torch.ops.wkv6.backward(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
+                gu = torch.sum(gu, 0).view(H, C//H)
+                return (gr, gk, gv, gw, gu)
+
+    @torch.compiler.disable
+    def RUN_CUDA_RWKV6(r, k, v, w, u):
+        return WKV_6.apply(r, k, v, w, u)
+
+else:
+    from fla.ops.rwkv6 import chunk_rwkv6
+    @torch.compiler.disable(recursive=True) 
+    # torch.compiler introduces errors in numerical precision (torch 2.4)
+    def RUN_FLA_CHUNK(B, T, C, H, r, k, v, w, u, h=None, scale=1.0, chunk_size=32):
+        r = r.view(B,T,H,-1).transpose(1,2)
+        k = k.view(B,T,H,-1).transpose(1,2)
+        v = v.view(B,T,H,-1).transpose(1,2)
+        # u can be 3d or 2d (B, H, -1) or just (H, -1) to save VRAM
+        w = -torch.exp(w.view(B,T,H,-1).transpose(1,2))
+        # change to scale=-1.0 when using fp16, this will apply scale to r and k.
+        o, _ = chunk_rwkv6(r, k, v, w, u=u, scale=scale, initial_state=None, 
+            output_final_state=False, chunk_size=chunk_size)
+        return o.transpose(1,2).reshape(B,T,C)
     
-class WKV_6(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, r, k, v, w, u):
-        with torch.no_grad():
-            B, T, C = r.size()
-            H = C // HEAD_SIZE
-            assert C % HEAD_SIZE == 0
-            assert r.dtype == torch.bfloat16
-            assert k.dtype == torch.bfloat16
-            assert v.dtype == torch.bfloat16
-            assert w.dtype == torch.bfloat16
-            assert u.dtype == torch.bfloat16
-            ctx.B = B
-            ctx.T = T
-            ctx.C = C
-            ctx.H = H
-            assert r.is_contiguous()
-            assert k.is_contiguous()
-            assert v.is_contiguous()
-            assert w.is_contiguous()
-            assert u.is_contiguous()
-            ctx.save_for_backward(r, k, v, w, u)
-            y = torch.empty((B, T, C), device=r.device, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            torch.ops.wkv6.forward(B, T, C, H, r, k, v, w, u, y)
-            return y
-
-    @staticmethod
-    def backward(ctx, gy):
-        with torch.no_grad():
-            assert gy.dtype == torch.bfloat16
-            B = ctx.B
-            T = ctx.T
-            C = ctx.C
-            H = ctx.H
-            assert gy.is_contiguous()
-            r, k, v, w, u = ctx.saved_tensors
-            gr = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            gk = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            gv = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            gw = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            gu = torch.empty((B, C), device=gy.device, requires_grad=False, dtype=torch.bfloat16, memory_format=torch.contiguous_format)#.uniform_(-100, 100)
-            torch.ops.wkv6.backward(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
-            gu = torch.sum(gu, 0).view(H, C//H)
-            return (gr, gk, gv, gw, gu)
-
-def RUN_CUDA_RWKV6(r, k, v, w, u):
-    return WKV_6.apply(r, k, v, w, u)
-
-RUN_CUDA_RWKV6 = torch.compiler.disable(RUN_CUDA_RWKV6)
+    def RUN_CUDA_RWKV6(r, k, v, w, u):
+        B, T, C = r.size()
+        return RUN_FLA_CHUNK(B, T, C, C // HEAD_SIZE, r, k, v, w, u)
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -570,9 +593,12 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 # begin logging
 if master_process:
     run_id = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
+    run_prefix = 'v6fla' if cmd_args.fla_cuda else 'v6'
+    if cmd_args.random_seed != -1:
+        run_prefix += ' seed{cmd_args.random_seed}'
     wandb.init(
         project='fast-nanogpt',
-        name=f'{cmd_args.adam_lr}/{cmd_args.emb_scale} {run_id}',
+        name=f'{run_prefix} {cmd_args.adam_lr}/{cmd_args.emb_scale} {run_id}',
         config=args,
         save_code=False,
     )
