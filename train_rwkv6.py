@@ -20,11 +20,11 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--headsz', type=int, default=64) # increase to 96/128/192 for better loss (slow in inefficient implementation, fast after optimization)
 parser.add_argument('--muon_lr', type=float, default=0.00036)
-parser.add_argument('--adam_lr', type=float, default=0.0022) # adam lr for misc weights (lora, time, etc.)
-parser.add_argument('--emb_scale', type=float, default=2.0) # rescale embedding to boost its adam lr
+parser.add_argument('--adam_lr', type=float, default=0.0020) # adam lr for misc weights (lora, time, etc.)
+parser.add_argument('--emb_scale', type=float, default=1.5) # rescale embedding to boost its adam lr
 parser.add_argument('--device_bsz', type=int, default=32) # have to use 32 instead of 64, due to strange pytorch VRAM issue
 parser.add_argument('--bsz', type=int, default=8*64)
-parser.add_argument('--fla_cuda', action=argparse.BooleanOptionalAction) # alternate cuda (experimental) (pip install --upgrade triton rwkv-fla)
+parser.add_argument('--fla_cuda', action=argparse.BooleanOptionalAction) # alternate cuda (experimental, slightly worse loss. pip install --upgrade triton rwkv-fla)
 parser.add_argument('--random_seed', type=int, default=-1)
 cmd_args = parser.parse_args()
 
@@ -151,7 +151,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
     zero even beyond the point where the iteration no longer converges all the way to one everywhere
     on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    where S' is diagonal with S_{ii}' \\sim Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert len(G.shape) == 2

@@ -17,7 +17,7 @@ __global__ void forward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_, 
     STile *sv_ = (STile*)smem; smem += sizeof(STile)*fw_stages*WARPS;
     STile *sa_ = (STile*)smem; smem += sizeof(STile)*fw_stages*WARPS;
     STile *sb_ = (STile*)smem; smem += sizeof(STile)*fw_stages*WARPS;
-    char*share = (char*)smem; smem += sizeof(float4)*32;
+    char*share = (char*)smem;
 
     int stride = H*C;
     int warpi = threadIdx.x/32;
@@ -34,10 +34,12 @@ __global__ void forward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_, 
     };
     for (int t = 0; t < fw_stages-1 && t < T/K; t++) push(t), __commit_group();
 
-    RTile state[WARPS];
+    FTile state[WARPS];
     for (int i = 0; i < WARPS; i++) {
         int off = bi*H*C*C + hi*C*C + warpi*16*C + i*16;
-        state[i] = GTile(s0_+off, C);
+        RTile tmp;
+        tmp = GTile(s0_+off, C);
+        state[i] = tmp;
     }
 
     for (int t = 0; t < T/K; t++) {
@@ -60,18 +62,20 @@ __global__ void forward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_, 
 
         RTile wq = (RTile)sq *     incl_pref, kwi = (RTile)sk * inv_incl_pref;
         RTile wa = (RTile)sa * non_incl_pref, bwi = (RTile)sb * inv_incl_pref;
-        RTile ab = sum_warp<1,WARPS>((float2*)share, tril<1>(wa % bwi));
+        FTile ab = sum_warp<1,WARPS>((float2*)share, tril<1>(wa % bwi));
         RTile ak = sum_warp<1,WARPS>((float2*)share, tril<1>(wa % kwi));
 
-        RTile ab_invT;
-        if (threadIdx.x < 32) ab_invT = tri_minvT(ab);
-        ab_invT = from_warp(ab_invT, 0, (float4*)share);
+        RTile ab_inv;
+        __syncthreads();
+        if (threadIdx.x < 32) ab_inv = tri_minv(ab, (float*)share);
+        __syncthreads();
+        ab_inv = from_warp(ab_inv, 0, (float4*)share);
 
         RTile vt = sv.t();
         FTile ab_ut = vt % ak;
         for (int i = 0; i < WARPS; i++)
             ab_ut += state[i] % from_warp(wa, i, (float4*)share);
-        RTile ut = FTile(ab_ut % transpose(ab_invT));
+        RTile ut = FTile(ab_ut % ab_inv);
 
         FTile y = sum_warp<1,WARPS>((float2*)share, tril<0>(wq % kwi)) % vt;
         y +=      sum_warp<1,WARPS>((float2*)share, tril<0>(wq % bwi)) % ut;
@@ -84,7 +88,7 @@ __global__ void forward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_, 
         RTile kwt = transpose(kwi*fw), bwt = transpose(bwi*fw);
         for (int i = 0; i < WARPS; i++) {
             int off = bi*H*(T/K)*C*C + hi*(T/K)*C*C + t*C*C + warpi*16*C + i*16;
-            GTile(s_+off, C) = state[i];
+            GTile(s_+off, C) = (RTile)state[i];
 
             FTile fstate = state[i] * from_warp(fw, i, (float4*)share);
             fstate += vt % from_warp(kwt, i, (float4*)share);
@@ -100,7 +104,8 @@ __global__ void forward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_, 
 
 void cuda_forward(int B, int T, int H, bf*w, bf*q, bf*k, bf*v, bf*z, bf*a, bf*s0, bf*y, bf*s, bf*sT) {
     assert(T%16 == 0);
-    constexpr int threads = 32*WARPS, shared_mem = sizeof(STile)*fw_stages*WARPS*6+sizeof(float4)*32;
+    constexpr int tmp_size1 = sizeof(float4)*32, tmp_size2 = sizeof(float)*16*16*2;
+    constexpr int threads = 32*WARPS, shared_mem = sizeof(STile)*fw_stages*WARPS*6 + (tmp_size1 > tmp_size2 ? tmp_size1 : tmp_size2);
     static int reported = 0;
     if (!reported++) {
 #if defined VERBOSE
@@ -134,8 +139,7 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
     STile *sb_ = (STile*)smem; smem += sizeof(STile)*bw_stages*WARPS;
     STile *sdy_ = (STile*)smem; smem += sizeof(STile)*bw_stages*WARPS;
     STile *state_ = (STile*)smem; smem += sizeof(STile)*bw_stages*WARPS*WARPS;
-    STile *dstate = (STile*)smem; smem += sizeof(STile)*bw_stages*WARPS*WARPS;
-    char*share = (char*)smem; smem += sizeof(float4)*32;
+    char*share = (char*)smem;
 
     int stride = H*C;
     int warpi = threadIdx.x/32;
@@ -156,9 +160,12 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
         }
     };
 
+    FTile dstate[WARPS];
     for (int i = 0; i < WARPS; i++) {
         int off = bi*H*C*C + hi*C*C + warpi*16*C + i*16;
-        dstate[warpi*WARPS+i] = GTile(dsT_+off, C);
+        RTile tmp;
+        tmp = GTile(dsT_+off, C);
+        dstate[i] = tmp;
         __commit_group();
     }
 
@@ -185,31 +192,34 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
 
         RTile wq = (RTile)sq *     incl_pref, kwi = (RTile)sk * inv_incl_pref;
         RTile wa = (RTile)sa * non_incl_pref, bwi = (RTile)sb * inv_incl_pref;
-        RTile ab = sum_warp<1,WARPS>((float2*)share, tril<1>(wa % bwi));
+        FTile ab = sum_warp<1,WARPS>((float2*)share, tril<1>(wa % bwi));
         RTile ak = sum_warp<1,WARPS>((float2*)share, tril<1>(wa % kwi));
 
-        RTile ab_invT;
-        if (threadIdx.x < 32) ab_invT = tri_minvT(ab);
-        ab_invT = from_warp(ab_invT, 0, (float4*)share);
+        RTile ab_inv;
+        __syncthreads();
+        if (threadIdx.x < 32) ab_inv = tri_minv(ab, (float*)share);
+        __syncthreads();
+        ab_inv = from_warp(ab_inv, 0, (float4*)share);
 
         RTile vt = sv.t();
         FTile ab_ut = vt % ak;
         for (int i = 0; i < WARPS; i++)
             ab_ut += state[warpi*WARPS+i] % from_warp(wa, i, (float4*)share);
-        RTile ut = FTile(ab_ut % transpose(ab_invT));
+        RTile ut = FTile(ab_ut % ab_inv);
 
         RTile qb = sum_warp<1,WARPS>((float2*)share, tril<0>(wq % bwi));
         RTile qk = sum_warp<1,WARPS>((float2*)share, tril<0>(wq % kwi));
 
         RTile dyt = sdy.t();
         FTile dut = FTile(dyt % transpose(qb));
-        for (int i = 0; i < WARPS; i++)
-            dut += dstate[warpi*WARPS+i] % from_warp(bwi*fw, i, (float4*)share);
-        RTile dab_ut = FTile(dut % ab_invT);
         FTile dv = transpose(qk) % dyt;
+        for (int i = 0; i < WARPS; i++) {
+            RTile dstatei = dstate[i];
+            dut += dstatei % from_warp(bwi*fw, i, (float4*)share);
+            dv += from_warp(kwi*fw, i, (float4*)share) % dstatei;
+        }
+        RTile dab_ut = FTile(dut % transpose(ab_inv));
         dv += transpose(ak) % dab_ut;
-        for (int i = 0; i < WARPS; i++)
-            dv += from_warp(kwi*fw, i, (float4*)share) % dstate[warpi*WARPS+i];
 
         int off = bi*T*H*C + t*K*H*C + hi*C + warpi*16;
         GTile(dv_+off, stride) = RTile(dv);
@@ -242,10 +252,29 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
 
         RTile wqt = transpose(wq), wat = transpose(wa);
 
-        FTile u_dstate;
+        FTile u_dstate, v_dstate, dw;
         u_dstate.zero_();
-        for (int i = 0; i < WARPS; i++)
-            u_dstate += from_warp(transpose(ut), i, (float4*)share) % dstate[i*WARPS+warpi].t();
+        v_dstate.zero_();
+        dw.zero_();
+        RTile ones;
+        for (int i = 0; i < 4; i++) ones.data[i] = to_bf2({1.f,1.f});
+        for (int i = 0; i < WARPS; i++) {
+            int tid = threadIdx.x%32;
+            if (warpi == i) {
+                for (int j = 0; j < WARPS; j++) {
+                    RTile ra = dstate[j];
+                    ((float4*)share)[j*32+tid] = *((float4*)ra.data);
+                }
+            }
+            RTile dstatei;// = dstate[i*WARPS+warpi];
+            __syncthreads();
+            *((float4*)dstatei.data) = ((float4*)share)[warpi*32+tid];
+            __syncthreads();
+            RTile dstatei_t = transpose(dstatei);
+            v_dstate += from_warp(transpose(vt), i, (float4*)share) % dstatei_t;
+            u_dstate += from_warp(transpose(ut), i, (float4*)share) % dstatei_t;
+            dw += ones % transpose((RTile)state[i*WARPS+warpi]*dstatei);
+        }
 
         FTile db = fw * u_dstate;
         db += transpose(dab) % wat;
@@ -253,23 +282,12 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
         db = inv_incl_pref * db;
         GTile(db_+off, stride) = RTile(db);
 
-        FTile v_dstate;
-        v_dstate.zero_();
-        for (int i = 0; i < WARPS; i++)
-            v_dstate += from_warp(transpose(vt), i, (float4*)share) % dstate[i*WARPS+warpi].t();
-
         FTile dk = fw * v_dstate;
         dk += transpose(dak) % wat;
         dk += transpose(dqk) % wqt;
         dk = inv_incl_pref * dk;
         GTile(dk_+off, stride) = RTile(dk);
 
-        FTile dw;
-        dw.zero_();
-        RTile ones;
-        for (int i = 0; i < 4; i++) ones.data[i] = to_bf2({1.f,1.f});
-        for (int i = 0; i < WARPS; i++)
-            dw += ones % transpose((RTile)state[i*WARPS+warpi]*(RTile)dstate[i*WARPS+warpi]);
         dw = fw * dw;
         dw += fast_dw<1>(dab,wa,bwi);
         dw += fast_dw<1>(dak,wa,kwi);
@@ -288,22 +306,23 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
 
         __syncthreads();
         for (int i = 0; i < WARPS; i++) {
-            FTile ndstate = (RTile)dstate[warpi*WARPS+i] * from_warp(fw, i, (float4*)share);
+            FTile ndstate = dstate[i] * from_warp(fw, i, (float4*)share);
             ndstate += dyt % from_warp(wqt, i, (float4*)share);
             ndstate += dab_ut % from_warp(wat, i, (float4*)share);
-            dstate[warpi*WARPS+i] = (RTile)ndstate;
+            dstate[i] = ndstate;
         }
         __syncthreads();
     }
     for (int i = 0; i < WARPS; i++) {
         int off = bi*H*C*C + hi*C*C + warpi*16*C + i*16;
-        GTile(ds0_+off, C) = dstate[warpi*WARPS+i];
+        GTile(ds0_+off, C) = dstate[i];
     }
 }
 
 void cuda_backward(int B, int T, int H, bf*w, bf*q, bf*k, bf*v, bf*z, bf*a, bf*dy, bf*s, bf*dsT, bf*dw, bf*dq, bf*dk, bf*dv, bf*dz, bf*da, bf*ds0) {
     assert(T%16 == 0);
-    constexpr int threads = 32*WARPS, shared_mem = sizeof(STile)*bw_stages*WARPS*(7+WARPS*2)+sizeof(float4)*32;
+    constexpr int tmp_size1 = sizeof(float4)*32*WARPS, tmp_size2 = sizeof(float)*16*16*2;
+    constexpr int threads = 32*WARPS, shared_mem = sizeof(STile)*WARPS*bw_stages*(7+WARPS) + (tmp_size1 > tmp_size2 ? tmp_size1 : tmp_size2);
     static int reported = 0;
     if (!reported++) {
 #if defined VERBOSE

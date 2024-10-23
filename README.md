@@ -23,7 +23,7 @@ Note: Currently very inefficient implementation. Please help if you are a Pytorc
 ### add --wind_cuda for much faster kernel (experimental, slightly worse loss) ###
 ./run_rwkv7.sh --adam_lr 0.0022 --emb_scale 2 --muon_lr 0.00036 --headsz 64 --bsz 512 --device_bsz 32
 
-./run_rwkv6.sh --adam_lr 0.0022 --emb_scale 2 --muon_lr 0.00036 --headsz 64 --bsz 512 --device_bsz 32
+./run_rwkv6.sh --adam_lr 0.0020 --emb_scale 1.5 --muon_lr 0.00036 --headsz 64 --bsz 512 --device_bsz 32
 ```
 
 ## Original Readme

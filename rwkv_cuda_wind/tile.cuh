@@ -319,26 +319,30 @@ __device__ RTile from_warp(const RTile&ra, int src, float4*share) {
     return ret;
 }
 
-// transpose(inv(I-f)) where f is strictly lower triangular
-// Numerically unstable?
-__device__ FTile tri_minvT(const FTile&f) {
+// inv(I-f) where f is strictly lower triangular
+__device__ FTile tri_minv(const FTile&f, float*share) {
     int i0 = threadIdx.x%32/4, j0 = threadIdx.x%4*2;
-
-    auto getCol = [&](int col, float eye) {
-        FTile ret;
-        for (int k = 0; k < 8; k++) {
-            int i = i0+k/2%2*8, j = j0+k%2+k/4*8;
-            if (j == col && j < i)
-                ret.fdata[k] = f.fdata[k]; // -
-            else
-                ret.fdata[k] = float(i==j)*eye;
+    float inv[16] = {};
+    for (int k = 0; k < 8; k++) {
+        int i = i0+k/2%2*8, j = j0+k%2+k/4*8;
+        share[i*16+j] = f.fdata[k];
+    }
+    int tid = threadIdx.x%32;
+    inv[tid%16] = 1;
+    for (int i = 1; i < 16; i++) {
+        for (int j = 0; j < i; j++) {
+            float fac = share[i*16+j];
+            inv[i] += fac*inv[j];
         }
-        return ret;
-    };
-    FTile prod = getCol(-1, 1.f);
-    for (int i = 0; i < 15; i++)
-        prod += (RTile)prod % getCol(i, 0.f);
-    return prod;
+    }
+    for (int i = 0; i < 16; i++)
+        share[tid*16+i] = inv[i];
+    FTile ret;
+    for (int k = 0; k < 8; k++) {
+        int i = i0+k/2%2*8, j = j0+k%2+k/4*8;
+        ret.fdata[k] = share[j*16+i];
+    }
+    return ret;
 }
 
 template<int strict>
