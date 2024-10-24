@@ -14,6 +14,11 @@ void backward(int64_t B, int64_t T, int64_t C, int64_t H, torch::Tensor &r, torc
 }
 
 TORCH_LIBRARY(wkv7g, m) {
-    m.def("forward", forward);
-    m.def("backward", backward);
+    m.def("forward(int B, int T, int C, int H, Tensor r, Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y, Tensor(b!) saa, Tensor(c!) sss) -> ()");
+    m.def("backward(int B, int T, int C, int H, Tensor r, Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor saa, Tensor sss, Tensor(a!) zzz, Tensor gy, Tensor(b!) gr, Tensor(c!) gw, Tensor(d!) gk, Tensor(e!) gv, Tensor(f!) ga, Tensor(g!) gb) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(wkv7g, CUDA, m) {
+    m.impl("forward", &forward);
+    m.impl("backward", &backward);
 }

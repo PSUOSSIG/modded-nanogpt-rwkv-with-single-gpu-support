@@ -13,6 +13,11 @@ void backward(int64_t B, int64_t T, int64_t C, int64_t H, torch::Tensor &r, torc
 }
 
 TORCH_LIBRARY(wkv6, m) {
-    m.def("forward", forward);
-    m.def("backward", backward);
+    m.def("forward(int B, int T, int C, int H, Tensor r, Tensor k, Tensor v, Tensor w, Tensor u, Tensor(a!) y) -> ()");
+    m.def("backward(int B, int T, int C, int H, Tensor r, Tensor k, Tensor v, Tensor w, Tensor u, Tensor gy, Tensor(a!) gr, Tensor(b!) gk, Tensor(c!) gv, Tensor(d!) gw, Tensor(e!) gu) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(wkv6, CUDA, m) {
+    m.impl("forward", &forward);
+    m.impl("backward", &backward);
 }

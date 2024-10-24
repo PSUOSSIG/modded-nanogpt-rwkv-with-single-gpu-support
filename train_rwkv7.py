@@ -22,9 +22,10 @@ parser.add_argument('--headsz', type=int, default=64) # increase to 96/128/192 f
 parser.add_argument('--muon_lr', type=float, default=0.00036)
 parser.add_argument('--adam_lr', type=float, default=0.0022) # adam lr for misc weights (lora, time, etc.)
 parser.add_argument('--emb_scale', type=float, default=2.0) # rescale embedding to boost its adam lr
-parser.add_argument('--device_bsz', type=int, default=32) # have to use 32 instead of 64, due to strange pytorch VRAM issue
+parser.add_argument('--device_bsz', type=int, default=64)
 parser.add_argument('--bsz', type=int, default=8*64)
-parser.add_argument('--wind_cuda', action=argparse.BooleanOptionalAction) # much faster cuda (experimental, slightly worse loss)
+parser.add_argument('--fast_cuda', action=argparse.BooleanOptionalAction) # much faster cuda, maybe worse loss
+parser.add_argument('--wind_cuda', action=argparse.BooleanOptionalAction) # even faster cuda, likely worse loss
 parser.add_argument('--random_seed', type=int, default=-1)
 cmd_args = parser.parse_args()
 
@@ -44,13 +45,8 @@ Changes:
 *) use Adam for misc weights (lora, time, etc.)
 
 Note:
-Currently runs at 50% GPT speed (when using --wind_cuda) due to:
-
-*) Strangely, takes more VRAM, so I have to reduce device_bsz to 32. I have some theory:
-1. Maybe current method of allocating tensor within custom op is suboptimal.
-2. Maybe torch amp has trouble deciding fp32 / bf16 especially when using custom op.
-
-*) Torch compile is not efficiently fusing the loras. I noticed JIT can be faster. This becomes worse when using custom op.
+Currently runs at 65% GPT speed (when using --wind_cuda) due to:
+*) The loras can be further fused.
 
 I think we can get it to 85% GPT speed @ ctxlen 1024 (can be faster than GPT @ ctxlen 4096) after more work.
 '''
@@ -63,8 +59,74 @@ sequence_length = 1024
 
 from torch.utils.cpp_extension import load
 
-if not cmd_args.wind_cuda:
+if cmd_args.wind_cuda:
+    load(name="wind", sources=['rwkv_cuda_wind/wind_rwkv7.cu', 'rwkv_cuda_wind/wind_rwkv7.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=[f'-D_C_={HEAD_SIZE}',"-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"])
 
+    class WindRWKV7(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx,w,q,k,v,a,b):
+            B,T,H,C = w.shape
+            s0 = torch.zeros(B,H,C,C,dtype=w.dtype,device=w.device)
+            assert T%16 == 0
+            assert all(i.dtype==torch.bfloat16 for i in [w,q,k,v,a,b,s0])
+            w,q,k,v,a,b,s0 = [i.contiguous() for i in [w,q,k,v,a,b,s0]]
+            y = torch.empty_like(v)
+            sT = torch.empty_like(s0)
+            s = torch.zeros(B,H,T//16,C,C, dtype=w.dtype,device=w.device)
+            torch.ops.wind.forward(w,q,k,v,a,b, s0,y,s,sT)
+            ctx.save_for_backward(w,q,k,v,a,b,s)
+            return y
+        
+        @staticmethod
+        def backward(ctx,dy):
+            w,q,k,v,a,b,s = ctx.saved_tensors
+            B,T,H,C = w.shape
+            dsT = torch.zeros(B,H,C,C,dtype=dy.dtype,device=dy.device)
+            assert all(i.dtype==torch.bfloat16 for i in [dy])
+            dy,dsT = [i.contiguous() for i in [dy,dsT]]
+            dw,dq,dk,dv,da,db,ds0 = [torch.empty_like(x) for x in [w,q,k,v,a,b,dsT]]
+            torch.ops.wind.backward(w,q,k,v,a,b, dy,s,dsT, dw,dq,dk,dv,da,db,ds0)
+            return dw,dq,dk,dv,da,db
+
+    def RUN_CUDA_RWKV7g(q,w,k,v,a,b):
+        B,T,HC = q.shape
+        q,w,k,v,a,b = [i.view(B,T,HC//HEAD_SIZE,HEAD_SIZE) for i in [q,w,k,v,a,b]]
+        return WindRWKV7.apply(w,q,k,v,a,b).view(B,T,HC)
+
+elif cmd_args.fast_cuda:
+    CHUNK_LEN = 16
+
+    flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
+    VERSION = 1 if HEAD_SIZE < 128 else 2
+    load(name="wind_backstepping", sources=[f'rwkv_cuda_wind/backstepping_f32_{VERSION}.cu', 'rwkv_cuda_wind/backstepping_f32.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+
+    class WindBackstepping(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, w,q,k,v,z,b):
+            B,T,H,C = w.shape 
+            assert T%CHUNK_LEN == 0
+            assert all(i.dtype==torch.bfloat16 for i in [w,q,k,v,z,b])
+            w,q,k,v,z,b = [i.contiguous() for i in [w,q,k,v,z,b]]
+            y = torch.empty_like(v)
+            s = torch.empty(B,H,T//CHUNK_LEN,C,C, dtype=torch.float32,device=w.device)
+            sa = torch.empty(B,T,H,C, dtype=torch.float32,device=w.device)
+            torch.ops.wind_backstepping.forward(w,q,k,v,z,b, y,s,sa)
+            ctx.save_for_backward(w,q,k,v,z,b,s,sa)
+            return y
+        @staticmethod
+        def backward(ctx, dy):
+            assert dy.dtype == torch.bfloat16
+            dy = dy.contiguous()
+            w,q,k,v,z,b,s,sa = ctx.saved_tensors
+            dw,dq,dk,dv,dz,db = [torch.empty_like(x) for x in [w,q,k,v,z,b]]
+            torch.ops.wind_backstepping.backward(w,q,k,v,z,b, dy,s,sa, dw,dq,dk,dv,dz,db)
+            return dw,dq,dk,dv,dz,db
+
+    def RUN_CUDA_RWKV7g(q,w,k,v,a,b):
+        B,T,HC = q.shape
+        q,w,k,v,a,b = [i.view(B,T,HC//64,64) for i in [q,w,k,v,a,b]]
+        return WindBackstepping.apply(w,q,k,v,a,b).view(B,T,HC)
+else:
     DTYPE = torch.bfloat16
     XTYPE = torch.float
     T = sequence_length
@@ -82,18 +144,8 @@ if not cmd_args.wind_cuda:
                 A = T // CHUNK_LEN
                 assert HEAD_SIZE == C // H
                 assert T % CHUNK_LEN == 0
-                assert r.dtype == DTYPE
-                assert w.dtype == DTYPE
-                assert k.dtype == DTYPE
-                assert v.dtype == DTYPE
-                assert a.dtype == DTYPE
-                assert b.dtype == DTYPE
-                assert r.is_contiguous()
-                assert w.is_contiguous()
-                assert k.is_contiguous()
-                assert v.is_contiguous()
-                assert a.is_contiguous()
-                assert b.is_contiguous()
+                assert all(i.dtype == DTYPE for i in [r,w,k,v,a,b])
+                r,w,k,v,a,b = [i.contiguous() for i in [r,w,k,v,a,b]]
                 ctx.B = B
                 ctx.T = T
                 ctx.C = C
@@ -114,7 +166,7 @@ if not cmd_args.wind_cuda:
                 H = ctx.H
                 A = T // CHUNK_LEN
                 assert gy.dtype == DTYPE
-                assert gy.is_contiguous()
+                gy = gy.contiguous()
                 r, w, k, v, a, b, saa, sss = ctx.saved_tensors
                 gr = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.zero_()#.uniform_(-100, 100)
                 gw = torch.empty((B, T, C), device=gy.device, requires_grad=False, dtype=DTYPE, memory_format=torch.contiguous_format)#.zero_()#.uniform_(-100, 100)
@@ -128,50 +180,8 @@ if not cmd_args.wind_cuda:
                 del sss
                 del zzz
                 return (gr, gw, gk, gv, ga, gb)
-    @torch.compiler.disable
     def RUN_CUDA_RWKV7g(r, w, k, v, a, b):
-        return WKV_7g.apply(r, w, k, v, a, b)
-
-else:
-
-    assert cmd_args.headsz == 64 # only for headsz 64
-
-    class WindRWKV7(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, w,q,k,v,a,b,s0):
-            B,T,H,C = w.shape
-            ctx.s0_is_None = s0 is None
-            s0 = torch.zeros(B,H,C,C, dtype=w.dtype,device=w.device) if s0 is None else s0
-            assert T%16 == 0
-            assert all(i.dtype==torch.bfloat16 for i in [w,q,k,v,a,b,s0])
-            assert all(i.is_contiguous() for i in [w,q,k,v,a,b,s0])
-            y = torch.empty_like(v)
-            sT = torch.empty_like(s0)
-            s = torch.zeros(B,H,T//16,C,C, dtype=w.dtype,device=w.device)
-            torch.ops.wind.forward(w,q,k,v,a,b, s0,y,s,sT)
-            ctx.save_for_backward(w,q,k,v,a,b,s)
-            return y, sT
-        @staticmethod
-        def backward(ctx, dy, dsT):
-            assert all(i.dtype==torch.bfloat16 for i in [dy,dsT])
-            assert all(i.is_contiguous() for i in [dy,dsT])
-            w,q,k,v,a,b,s = ctx.saved_tensors
-            dw,dq,dk,dv,da,db,ds0 = [torch.empty_like(x) for x in [w,q,k,v,a,b,dsT]]
-            torch.ops.wind.backward(w,q,k,v,a,b, dy,s,dsT, dw,dq,dk,dv,da,db,ds0)
-            return dw,dq,dk,dv,da,db,(None if ctx.s0_is_None else ds0) 
-    wind_rwkv7 = WindRWKV7.apply
-
-    @torch.compile
-    def wind(w,q,k,v,a,b, s0=None, return_state = False, path = ''):
-        if not 'wind' in dir(torch.ops):
-            B,T,H,C = w.shape
-            load(name="wind", sources=[path+'wind_rwkv7.cu', path+'wind_rwkv7.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=[f'-D_C_={C}',"-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"])
-        return wind_rwkv7(w,q,k,v,a,b,s0)[:return_state+1]
-
-    def RUN_CUDA_RWKV7g(q, w, k, v, a, b):
-        B,T,HC = q.shape
-        q,w,k,v,a,b = [i.view(B,T,HC//HEAD_SIZE,HEAD_SIZE) for i in [q,w,k,v,a,b]]
-        return wind(w,q,k,v,a,b, path='rwkv_cuda_wind/')[0].view(B,T,HC)    
+        return WKV_7g.apply(r, w, k, v, a, b)      
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -607,9 +617,11 @@ x, y = train_loader.next_batch()
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=768//HEAD_SIZE, n_embd=768))
 model = model.cuda()
+torch._dynamo.config.optimize_ddp = False # otherwise compiler will complain
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model)
+# config.max_autotune = True # faster, but VERY slow to compile
+model = torch.compile(model, fullgraph=True)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
@@ -659,7 +671,7 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 # begin logging
 if master_process:
     run_id = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
-    run_prefix = 'v7wind' if cmd_args.wind_cuda else 'v7'
+    run_prefix = 'v7wind' if cmd_args.wind_cuda else ('v7fast' if cmd_args.fast_cuda else 'v7')
     if cmd_args.random_seed != -1:
         run_prefix += f' seed{cmd_args.random_seed}'
     wandb.init(
