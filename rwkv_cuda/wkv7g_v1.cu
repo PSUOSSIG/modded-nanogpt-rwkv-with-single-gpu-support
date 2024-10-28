@@ -48,7 +48,7 @@ __global__ void kernel_forward(const int B, const int T, const int C, const int 
         for (int j = 0; j < _N_; j++)
         {
             float& s = state[j];
-            s = s * w[j] + k[j] * vv + sa * b[j];
+            s = s * w[j] + sa * b[j] + k[j] * vv;
             y += s * r[j];
         }
         _y[t] = F(y);
@@ -190,7 +190,7 @@ __global__ void kernel_backward_rwkv(const int B, const int T, const int C, cons
             ww[n] = -__expf(float(_w[b_t_h+n]));
             w[n] = __expf(ww[n]);
             ww[n] = ww[n] * w[n];
-            winv[n] = 1.0 / w[n];
+            winv[n] = 1.0f / w[n];
         }
 
         for (int j = 0; j < _N_; j++)

@@ -3,7 +3,7 @@
 
 using bf = __nv_bfloat16;
 __device__ inline float to_float(const bf & u) { return __bfloat162float(u); }
-__device__ inline bf to_bf(const float & u) { return 	__float2bfloat16_rn(u); }
+__device__ inline bf to_bf(const float & u) { return __float2bfloat16_rn(u); }
 
 typedef bf * __restrict__ F_;
 
@@ -11,7 +11,7 @@ __global__ void forward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_, 
     constexpr int C = _C_;
     int bind = blockIdx.y, hind = blockIdx.x, i = threadIdx.x;
 
-    float state[C] = {};
+    float state[C] = {0};
     __shared__ float q[C], k[C], w[C], a[C], b[C];
 
     for (int t = 0; t < T; t++) {
@@ -36,7 +36,7 @@ __global__ void forward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_, 
 #pragma unroll
         for (int j = 0; j < C; j++) {
             float& s = state[j];
-            s = s * w[j] + k[j] * v + sa * b[j];
+            s = s * w[j] + sa * b[j] + k[j] * v;
             y += s * q[j];
         }
         y_[ind] = to_bf(y);
@@ -55,7 +55,7 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
     constexpr int C = _C_;
     int bind = blockIdx.y, hind = blockIdx.x, i = threadIdx.x;
 
-    float stateT[C] = {};
+    float stateT[C] = {0};
     __shared__ float w[C], q[C], k[C], v[C], a[C], b[C], dy[C], sa[C], dSb_shared[C];
 
     extern __shared__ char smem_[];
@@ -95,9 +95,9 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
         }
         dq_[ind] = to_bf(dq);
 
-        float iwi = 1.f/wi;
+        float iwi = 1.0f/wi;
         for (int j = 0; j < C; j++) {
-            stateT[j] = (stateT[j] - bi*sa[j] - ki*v[j]) * iwi;
+            stateT[j] = (stateT[j] - ki*v[j] - bi*sa[j]) * iwi;
             dstate[i*(C+1)+j] += dyi * q[j];
         }
 
@@ -146,4 +146,3 @@ void cuda_backward(int B, int T, int H, bf*w, bf*q, bf*k, bf*v, bf*z, bf*a, bf*d
     assert(!cudaFuncSetAttribute(backward_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
     backward_kernel<<<dim3(H,B), dim3(_C_), shared_mem>>>(T,H,w,q,k,v,z,a,dy,s,sa,dw,dq,dk,dv,dz,da);
 }
-

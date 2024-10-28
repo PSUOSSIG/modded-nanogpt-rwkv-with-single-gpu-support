@@ -58,9 +58,10 @@ HEAD_SIZE = cmd_args.headsz
 sequence_length = 1024
 
 from torch.utils.cpp_extension import load
+CUDA_FLAGS = ["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
 
 if cmd_args.wind_cuda:
-    load(name="wind", sources=['rwkv_cuda_wind/wind_rwkv7.cu', 'rwkv_cuda_wind/wind_rwkv7.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=[f'-D_C_={HEAD_SIZE}',"-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"])
+    load(name="wind", sources=['rwkv_cuda_wind/wind_rwkv7.cu', 'rwkv_cuda_wind/wind_rwkv7.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=CUDA_FLAGS+[f'-D_C_={HEAD_SIZE}'])
 
     class WindRWKV7(torch.autograd.Function):
         @staticmethod
@@ -96,9 +97,7 @@ if cmd_args.wind_cuda:
 elif cmd_args.fast_cuda:
     CHUNK_LEN = 16
 
-    flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
-    VERSION = 1 if HEAD_SIZE < 128 else 2
-    load(name="wind_backstepping", sources=[f'rwkv_cuda_wind/backstepping_f32_{VERSION}.cu', 'rwkv_cuda_wind/backstepping_f32.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+    load(name="wind_backstepping", sources=[f'rwkv_cuda_wind/backstepping_f32_{1 if HEAD_SIZE < 128 else 2}.cu', 'rwkv_cuda_wind/backstepping_f32.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=CUDA_FLAGS+[f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}"])
 
     class WindBackstepping(torch.autograd.Function):
         @staticmethod
@@ -132,8 +131,7 @@ else:
     T = sequence_length
     CHUNK_LEN = 16
 
-    load(name="wkv7g", sources=["rwkv_cuda/wkv7g_op.cpp", f"rwkv_cuda/wkv7g_v1.cu"], is_python_module=False,
-                        verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}", f"-D_T_={T}", f"-D_CHUNK_LEN_={CHUNK_LEN}"])
+    load(name="wkv7g", sources=["rwkv_cuda/wkv7g_op.cpp", f"rwkv_cuda/wkv7g_v1.cu"], is_python_module=False, verbose=True, extra_cuda_cflags=CUDA_FLAGS+[f"-D_N_={HEAD_SIZE}", f"-D_T_={T}", f"-D_CHUNK_LEN_={CHUNK_LEN}"])
     class WKV_7g(torch.autograd.Function):
         @staticmethod
         def forward(ctx, r, w, k, v, a, b):
