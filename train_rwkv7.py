@@ -24,7 +24,7 @@ parser.add_argument('--adam_lr', type=float, default=0.0022) # adam lr for misc 
 parser.add_argument('--emb_scale', type=float, default=2.0) # rescale embedding to boost its adam lr
 parser.add_argument('--device_bsz', type=int, default=64)
 parser.add_argument('--bsz', type=int, default=8*64)
-parser.add_argument('--fast_cuda', action=argparse.BooleanOptionalAction) # much faster cuda, maybe worse loss
+parser.add_argument('--fast_cuda', action=argparse.BooleanOptionalAction) # much faster cuda
 parser.add_argument('--wind_cuda', action=argparse.BooleanOptionalAction) # even faster cuda, likely worse loss
 parser.add_argument('--random_seed', type=int, default=-1)
 cmd_args = parser.parse_args()
@@ -45,7 +45,7 @@ Changes:
 *) use Adam for misc weights (lora, time, etc.)
 
 Note:
-Currently runs at 65% GPT speed (when using --wind_cuda) due to:
+Currently runs at 65% GPT speed (when using --fast_cuda or --wind_cuda) due to:
 *) The loras can be further fused.
 
 I think we can get it to 85% GPT speed @ ctxlen 1024 (can be faster than GPT @ ctxlen 4096) after more work.

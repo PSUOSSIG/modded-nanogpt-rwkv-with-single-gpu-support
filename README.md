@@ -20,8 +20,10 @@ Try 0.0020/0.0022/0.0024 for adam_lr. Try 1.5/2/2.5 for emb_scale. Reduce device
 ```
 Note: Currently inefficient implementation. Please help if you are a Pytorch / CUDA / triton master :)
 
+./run_rwkv7.sh --adam_lr 0.0022 --emb_scale 2 --muon_lr 0.00036 --headsz 64 --bsz 512 --device_bsz 64 --fast_cuda (much faster cuda)
+
 ./run_rwkv7.sh --adam_lr 0.0022 --emb_scale 2 --muon_lr 0.00036 --headsz 64 --bsz 512 --device_bsz 32 (reference, takes more VRAM, have to reduce device_bsz)
-./run_rwkv7.sh --adam_lr 0.0022 --emb_scale 2 --muon_lr 0.00036 --headsz 64 --bsz 512 --device_bsz 64 --fast_cuda (much faster cuda, maybe worse loss)
+
 ./run_rwkv7.sh --adam_lr 0.0022 --emb_scale 2 --muon_lr 0.00036 --headsz 64 --bsz 512 --device_bsz 64 --wind_cuda (even faster cuda, likely worse loss)
 
 ./run_rwkv6.sh --adam_lr 0.0020 --emb_scale 1.5 --muon_lr 0.00036 --headsz 64 --bsz 512 --device_bsz 64
