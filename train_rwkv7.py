@@ -337,7 +337,7 @@ class RWKV7(nn.Module):
             self.time_kkk_w2 = nn.Parameter(ortho_init(torch.zeros(D_KKK_LORA, args.dim_att), 0.1))
 
             D_GATE_LORA = 128
-            self.gate_w1 = nn.Parameter(ortho_init(torch.zeros(args.n_embd, D_GATE_LORA), 0.1))
+            self.gate_w1 = nn.Parameter(torch.zeros(args.n_embd, D_GATE_LORA))
             self.gate_w2 = nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, args.dim_att), 0.1))
 
             D_MA_LORA = 16
@@ -369,22 +369,22 @@ class RWKV7(nn.Module):
         xxx = x + xx * self.time_maa_x
         xxx = torch.tanh(xxx @ self.time_maa_w1).view(B*T, 4, -1).transpose(0, 1)
         xxx = torch.bmm(xxx, self.time_maa_w2).view(4, B, T, -1)
-        mrg, mwa, mk, mv = xxx.unbind(dim=0)
+        xrg, xwa, xk, xv = xxx.unbind(dim=0)
 
-        xrg = x + xx * (self.time_maa_rg + mrg)
-        xwa = x + xx * (self.time_maa_wa + mwa)
-        xk = x + xx * (self.time_maa_k + mk)
-        xv = x + xx * (self.time_maa_v + mv)
+        xrg = x + xx * (self.time_maa_rg + xrg)
+        xwa = x + xx * (self.time_maa_wa + xwa)
+        xk = x + xx * (self.time_maa_k + xk)
+        xv = x + xx * (self.time_maa_v + xv)
 
         r = self.receptance(xrg)
         w = -F.softplus(-(self.time_decay + torch.tanh(xwa @ self.time_decay_w1) @ self.time_decay_w2)) - 0.5
         k = self.key(xk)
         v = self.value(xv)
-        g = torch.tanh(xrg @ self.gate_w1) @ self.gate_w2
+        g = torch.sigmoid(xrg @ self.gate_w1) @ self.gate_w2
 
         kk = k + torch.tanh(xk @ self.time_kkk_w1) @ self.time_kkk_w2
         kk = F.normalize(kk.view(B,T,H,-1), dim=-1, p=2.0).view(B,T,C)
-        a = torch.sigmoid( self.time_aaaaa + (xwa @ self.time_aaa_w1) @ self.time_aaa_w2 )
+        a = torch.sigmoid(self.time_aaaaa + (xwa @ self.time_aaa_w1) @ self.time_aaa_w2)
 
         ma = torch.sigmoid(self.time_misc_a + (xwa @ self.ma_w1) @ self.ma_w2)
         k = k * ma + k*a * (1 - ma)
