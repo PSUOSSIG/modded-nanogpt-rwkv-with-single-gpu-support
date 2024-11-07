@@ -33,22 +33,25 @@ Note: Currently inefficient implementation. Please help if you are a Pytorch / C
 
 ## Original Readme
 
-This is a fast variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
+This is a modified variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
 Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
-* 2.4B tokens instead of 10B
-* 10.8 minutes on 8xH100 instead of 45
+* 1.7B tokens instead of 10B
+* 8.2 minutes on 8xH100 instead of 45
 
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
-* Projection layers initialized to zero (muP-like).
-* Untied head from embedding and init to zero.
 * New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
+* Untied head from embedding.
+* Projection and classification layers initialized to zero (muP-like).
+* Architectural shortcuts: value residual and embedding shortcut (partially following https://arxiv.org/abs/2410.17897).
+* Momentum warmup.
+* Tanh soft logit capping (following Gemma 2).
 
 To execute the training, run the following three commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
 ```bash
 pip install -r requirements.txt
-python data/cached_fineweb10B.py 24 # downloads only the first 2.4B training tokens to save time
+python data/cached_fineweb10B.py 18 # downloads only the first 1.8B training tokens to save time
 ./run.sh
 ```
 
@@ -66,9 +69,10 @@ The following is the progression of world records for the task of *training a mo
 5. [15.2 minutes: Pad embeddings & architectural modernizations](https://x.com/kellerjordan0/status/1845865698532450646) (10/14/24) [[reproducible log](./records/101424_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt)]
 6. [13.1 minutes: Distributed the overhead of Muon](https://x.com/kellerjordan0/status/1847291684016783746) (10/18/24) [[reproducible log](./records/101724_DistributedMuon/22d24867-eb5a-4fcc-ae2c-263d0277dfd1.txt)]
 7. [12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0](https://x.com/kellerjordan0/status/1847358578686152764) (10/18/24) [[reproducible log](./records/101824_PyTorch25/d4bfb25f-688d-4da5-8743-33926fad4842.txt)] (note: this now runs at the same speed per step as the CUDA llm.c trainer!)
-8. [10.8 minutes: Untied embed and lm_head]() (11/03/24) [[reproducible log](./records/110324_UntieEmbed/d6b50d71-f419-4d26-bb39-a60d55ae7a04.txt)]
+8. [10.8 minutes: Untied embed and lm_head](https://x.com/kellerjordan0/status/1853188916704387239) (11/03/24) [[reproducible log](./records/110324_UntieEmbed/d6b50d71-f419-4d26-bb39-a60d55ae7a04.txt)]
+9. [8.2 minutes: Shortcuts & tweaks](https://x.com/kellerjordan0/status/1854296101303800108) (11/06/24) [[reproducible log](./records/110624_ShortcutsTweaks/dd7304a6-cc43-4d5e-adb8-c070111464a1.txt)]
 
-Direct contributors to these records: @Grad62304977, @bozavlado, myself
+Direct contributors to these records: [@Grad62304977](https://x.com/Grad62304977), [Vlado Boza](https://x.com/bozavlado), myself
 
 Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
@@ -102,7 +106,7 @@ So if you're rational, the result probably just dies with you and no one else le
 
 ### Q: NanoGPT speedrunning is cool and all, but meh it probably won't scale and is just overfitting to val loss
 
-A: Ok, well, "at scale" is an infinite category (what if the methods stop working only for >100T models?), so it's impossible for me to conclusively refute the allegation that whatever we're doing here doesn't work at scale.
+A: This is hard to refute, since "at scale" is an infinite category (what if the methods stop working only for >100T models?), making it impossible to prove anything works at arbitrary scale.
 But if you care about 1.5B models, then you might be convinced by this result:
 
 *Straightforwardly scaling up the speedrun to 1.5B parameters yields a model with GPT-2 (1.5B)-level quality 2.5x more cheaply than [@karpathy's baseline](https://github.com/karpathy/llm.c/discussions/677) ($233 instead of $576):*
