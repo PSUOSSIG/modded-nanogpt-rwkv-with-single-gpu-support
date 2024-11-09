@@ -6,6 +6,17 @@ RWKV Twitter: https://twitter.com/BlinkDL_AI
 
 ## RWKV-6 and RWKV-7
 
+### Latest run: 3200 steps to reach 2.27xx loss
+
+This is using latest (current) train_rwkv7.py
+```
+./run_rwkv7.sh --adam_lr 0.0026 --muon_lr 0.02 --ln_lr 0.0090 --headsz 64 --bsz 512 --device_bsz 32 --fast_cuda
+```
+
+### Old run (!!! using old commits !!!)
+
+This is using old train_rwkv7.py
+
 Please read https://x.com/BlinkDL_AI/status/1848343821467390156 first.
 
 Modded-GPT 123.6M headsize 128 => val_loss 3.27xx

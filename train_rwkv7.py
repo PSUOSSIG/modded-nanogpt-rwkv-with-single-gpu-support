@@ -1,10 +1,10 @@
 import os
-import sys, math
+import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import glob
-import time, datetime, random
+import time, datetime, wandb
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,14 +14,13 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
-import wandb
-import argparse
 
+import argparse, random, math
 parser = argparse.ArgumentParser()
 parser.add_argument('--headsz', type=int, default=64) # increase to 96/128/192 for better loss (slow in inefficient implementation, fast after optimization)
-parser.add_argument('--muon_lr', type=float, default=0.00036)
-parser.add_argument('--adam_lr', type=float, default=0.0022) # adam lr for misc weights (lora, time, etc.)
-parser.add_argument('--emb_scale', type=float, default=2.0) # rescale embedding to boost its adam lr
+parser.add_argument('--muon_lr', type=float, default=0.02)
+parser.add_argument('--adam_lr', type=float, default=0.0026) # adam lr for misc weights (lora, time, etc.)
+parser.add_argument('--ln_lr', type=float, default=0.0090)
 parser.add_argument('--device_bsz', type=int, default=64)
 parser.add_argument('--bsz', type=int, default=8*64)
 parser.add_argument('--fast_cuda', action=argparse.BooleanOptionalAction) # much faster cuda
@@ -36,19 +35,15 @@ if cmd_args.random_seed != -1:
     torch.cuda.manual_seed_all(cmd_args.random_seed)
 
 '''
-Based on the GPT code in "101424_ModernArch" folder (please diff it to see the changes)
+Based on the GPT code in "110624_ShortcutsTweaks" folder (please diff it to see the changes)
 
 Changes:
 *) CausalSelfAttention => RWKV-7
 *) FFN 4x => 3.5x (to keep params count)
 *) rms_norm => LayerNorm
-*) use Adam for misc weights (lora, time, etc.)
 
 Note:
-Currently runs at 65% GPT speed (when using --fast_cuda or --wind_cuda) due to:
-*) The loras can be further fused.
-
-I think we can get it to 85% GPT speed @ ctxlen 1024 (can be faster than GPT @ ctxlen 4096) after more work.
+Currently inefficient. I think we can reach 85% GPT speed @ ctxlen 1024 (can be faster than GPT @ ctxlen 4096) after more work.
 '''
 
 # -----------------------------------------------------------------------------
@@ -179,7 +174,7 @@ else:
                 del zzz
                 return (gr, gw, gk, gv, ga, gb)
     def RUN_CUDA_RWKV7g(r, w, k, v, a, b):
-        return WKV_7g.apply(r, w, k, v, a, b)      
+        return WKV_7g.apply(r, w, k, v, a, b)
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -196,7 +191,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
     zero even beyond the point where the iteration no longer converges all the way to one everywhere
     on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \\sim Uniform(0.5, 1.5), which turns out not to hurt model
+    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert len(G.shape) == 2
@@ -240,33 +235,49 @@ class Muon(torch.optim.Optimizer):
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend='newtonschulz5', backend_steps=5):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 backend='newtonschulz5', backend_steps=5):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
 
     def step(self):
+
         for group in self.param_groups:
+
             lr = group['lr']
             momentum = group['momentum']
             zeropower_backend = zeropower_backends[group['backend']]
-            for p in group['params']:
-                g = p.grad
-                if g is None:
-                    continue
-                state = self.state[p]
-                if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(g)
-                buf = state['momentum_buffer']
-                buf.mul_(momentum).add_(g)
-                if group['nesterov']:
-                    g = g.add(buf, alpha=momentum)
-                if g.size(0) == 3 * g.size(1): # split grouped QKV parameters
-                    g = torch.cat([zeropower_backend(g1, steps=group['backend_steps']) for g1 in g.split(g.size(1))])
-                    scale = g.size(1)**0.5
-                else:
+
+            # generate weight updates in distributed fashion
+            total_params = sum(p.numel() for p in group['params'])
+            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            curr_idx = 0
+            for i, p in enumerate(group['params']):
+                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
+                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(g)
+                    if group['nesterov']:
+                        g = g.add(buf, alpha=momentum)
                     g = zeropower_backend(g, steps=group['backend_steps'])
-                    scale = max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
-                p.data.add_(g, alpha=-lr * scale)
+                    g *= max(1, g.size(0)/g.size(1))**0.5
+                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                curr_idx += p.numel()
+
+            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            # deserialize and apply updates
+            curr_idx = 0
+            for p in group['params']:
+                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                p.data.add_(g, alpha=-lr)
+                curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the RWKV-7 model (optimized for 123M params performance)
@@ -320,7 +331,7 @@ class RWKV7(nn.Module):
                         assert False
                     return x
 
-            D_MIX_LORA = 32
+            D_MIX_LORA = 28
             self.time_maa_w1 = nn.Parameter(torch.zeros(args.n_embd, D_MIX_LORA*4))
             self.time_maa_w2 = nn.Parameter(ortho_init(torch.zeros(4, D_MIX_LORA, args.n_embd), 0.1))
 
@@ -336,7 +347,7 @@ class RWKV7(nn.Module):
             self.time_kkk_w1 = nn.Parameter(torch.zeros(args.n_embd, D_KKK_LORA))
             self.time_kkk_w2 = nn.Parameter(ortho_init(torch.zeros(D_KKK_LORA, args.dim_att), 0.1))
 
-            D_GATE_LORA = 128
+            D_GATE_LORA = 120
             self.gate_w1 = nn.Parameter(torch.zeros(args.n_embd, D_GATE_LORA))
             self.gate_w2 = nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, args.dim_att), 0.1))
 
@@ -348,6 +359,11 @@ class RWKV7(nn.Module):
             self.mk_w1 = nn.Parameter(torch.zeros(args.n_embd, D_MK_LORA))
             self.mk_w2 = nn.Parameter(ortho_init(torch.zeros(D_MK_LORA, args.dim_att), 0.1))
             self.time_misc_k = nn.Parameter(torch.zeros(1,1,args.n_embd))
+            if layer_id != 0:
+                D_MV_LORA = 16
+                self.mv_w1 = nn.Parameter(torch.zeros(args.n_embd, D_MV_LORA))
+                self.mv_w2 = nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, args.dim_att), 0.1))
+                self.time_misc_v = nn.Parameter(torch.zeros(1,1,args.n_embd)+1.0)
 
             self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
             self.receptance = nn.Linear(args.n_embd, args.dim_att, bias=False)
@@ -361,7 +377,7 @@ class RWKV7(nn.Module):
             self.value.weight.data.uniform_(-0.5/(self.n_embd**0.5), 0.5/(self.n_embd**0.5))
             self.output.weight.data.zero_()
 
-    def forward(self, x):
+    def forward(self, x, v1):
         B, T, C = x.size()
         H = self.n_head
         xx = self.time_shift(x) - x
@@ -380,6 +396,10 @@ class RWKV7(nn.Module):
         w = -F.softplus(-(self.time_decay + torch.tanh(xwa @ self.time_decay_w1) @ self.time_decay_w2)) - 0.5
         k = self.key(xk)
         v = self.value(xv)
+        if self.layer_id == 0:
+            v1 = v
+        else:
+            v = v + (v1 - v) * torch.sigmoid(self.time_misc_v + (xv @ self.mv_w1) @ self.mv_w2)
         g = torch.sigmoid(xrg @ self.gate_w1) @ self.gate_w2
 
         kk = k + torch.tanh(xk @ self.time_kkk_w1) @ self.time_kkk_w2
@@ -396,7 +416,7 @@ class RWKV7(nn.Module):
 
         x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.time_faaaa).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
         x = self.output(x * g)
-        return x
+        return x, v1
 
 class MLP(nn.Module):
 
@@ -418,14 +438,16 @@ class Block(nn.Module):
         super().__init__()
         self.attn = RWKV7(config, layer_id)
         self.mlp = MLP(config)
-
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x, v1, x0):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x1, v1 = self.attn(self.ln1(x), v1)
+        x = x + x1
         x = x + self.mlp(self.ln2(x))
-        return x
+        return x, v1
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -434,7 +456,7 @@ class Block(nn.Module):
 class GPTConfig:
     vocab_size : int = 50304
     n_layer : int = 12
-    n_head : int = 768//HEAD_SIZE
+    n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
 
 class GPT(nn.Module):
@@ -448,27 +470,29 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config, layer_id) for layer_id in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-
-        self.ln_out = nn.LayerNorm(config.n_embd)
+        self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, targets=None, return_logits=True):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        x = x * cmd_args.emb_scale # rescale embedding
+        x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
+        x0 = x
+        v1 = None
         for block in self.transformer.h:
-            x = block(x)
-        x = self.ln_out(x)
+            x, v1 = block(x, v1, x0)
+        x = F.rms_norm(x, (x.size(-1),))
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            logits = 30 * torch.tanh(logits / 30)
             logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = 30 * torch.tanh(logits / 30)
             logits = logits.float() # use tf32/fp32 for logits
             loss = None
 
@@ -565,10 +589,9 @@ class Hyperparameters:
     batch_size : int = cmd_args.bsz # batch size, in sequences, across all devices
     device_batch_size : int = cmd_args.device_bsz # batch size, in sequences, per device
     sequence_length : int = sequence_length # sequence length, in tokens
-    num_iterations : int = 5100 # number of iterations to run
-    learning_rate : float = -1
+    num_iterations : int = 3200 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 914 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -579,7 +602,7 @@ args = Hyperparameters()
 args.headsz = cmd_args.headsz
 args.muon_lr = cmd_args.muon_lr
 args.adam_lr = cmd_args.adam_lr
-args.emb_scale = cmd_args.emb_scale
+args.ln_lr = cmd_args.ln_lr
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -624,33 +647,34 @@ model = torch.compile(model, fullgraph=True)
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+# CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
+from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+enable_cudnn_sdp(True)
+enable_flash_sdp(False)
+enable_mem_efficient_sdp(False)
+enable_math_sdp(False)
 
 # init the optimizer(s)
-opt_group1 = []
-opt_group2 = []
-opt_name1 = []
-opt_name2 = []
-n_params = 0
-for n,p in raw_model.named_parameters():
-    if ".attn.receptance." in n or 'attn.key.' in n or 'attn.value.' in n or 'attn.gate.' in n or 'attn.output.' in n or '.mlp.' in n:# or '_w1' in n or '_w2' in n:
-        opt_group2.append(p)
-        if '.1.' not in n and '.2.' not in n and '.3.' not in n and '.4.' not in n and '.5.' not in n and '.6.' not in n and '.7.' not in n and '.8.' not in n and '.9.' not in n and '.10.' not in n and '.11.' not in n:
-            opt_name2.append(n)
-    else:
-        opt_group1.append(p)
-        if '.1.' not in n and '.2.' not in n and '.3.' not in n and '.4.' not in n and '.5.' not in n and '.6.' not in n and '.7.' not in n and '.8.' not in n and '.9.' not in n and '.10.' not in n and '.11.' not in n:
-            opt_name1.append(n)
-    n_params += p.numel()
-if master_process:
-    print('model params', n_params)
-    print(f'Adam\n{opt_name1}...')
-    print(f'Muon\n{opt_name2}...')
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
+optimizer1.my_name = 'Adam-wte'
 
-# init the optimizer(s)
-optimizer1 = torch.optim.AdamW(opt_group1, lr=cmd_args.adam_lr, betas=(0.9, 0.95),
-                               weight_decay=args.weight_decay, fused=True)
-optimizer2 = Muon(opt_group2, lr=cmd_args.muon_lr, momentum=0.95)
-optimizers = [optimizer1, optimizer2]
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
+optimizer2.my_name = 'Adam-head'
+
+params = list(raw_model.transformer.h.named_parameters())
+optimizer3 = Muon([p for n,p in params if p.ndim == 2 and '_w1' not in n and '_w2' not in n], lr=args.muon_lr, momentum=0.95)
+optimizer3.my_name = 'Muon !!!'
+
+optimizer4 = torch.optim.Adam([p for n,p in params if (p.ndim != 2 or '_w1' in n or '_w2' in n) and ('lambdas' not in n and 'ln' not in n)], lr=args.adam_lr, betas=(0.9, 0.95), fused=True)
+optimizer4.my_name = 'Adam'
+
+optimizer5 = torch.optim.Adam([p for n,p in params if 'lambdas' in n], lr=0.02, betas=(0.9, 0.95), fused=True)
+optimizer5.my_name = 'Adam-s'
+
+optimizer6 = torch.optim.Adam([p for n,p in params if 'ln' in n], lr=args.ln_lr, betas=(0.9, 0.95), fused=True)
+optimizer6.my_name = 'Adam-LN'
+
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4, optimizer5, optimizer6]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -665,7 +689,28 @@ def get_lr(it):
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
-
+if master_process:
+    n_params = 0
+    n_found = []
+    n_all = []
+    for n,p in raw_model.named_parameters():
+        n_all.append(n)
+        n_params += p.numel()
+        found = False
+        for o in optimizers:
+            for group in o.param_groups:
+                for pp in group['params']:
+                    if p.data_ptr() == pp.data_ptr():
+                        n_found.append(n)
+                        found = True
+                        print(o.my_name.ljust(10), str(list(p.shape)).ljust(20), n)
+        if not found:
+            print('MISSING optimizer:', n)
+            exit(1)
+    print(n_all)
+    print(n_all)
+    print(list(set(n_all) - set(n_all)))
+    print('model params', n_params)
 # begin logging
 if master_process:
     run_id = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
@@ -674,18 +719,17 @@ if master_process:
         run_prefix += f' seed{cmd_args.random_seed}'
     wandb.init(
         project='fast-nanogpt',
-        name=f'{run_prefix} {cmd_args.adam_lr}/{cmd_args.emb_scale} {run_id}',
+        name=f'{run_prefix} {args.adam_lr}/{args.muon_lr}/{args.ln_lr} {run_id}',
         config=args,
         save_code=False,
     )
-
     logdir = 'logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
     # create the log file
     with open(logfile, "w") as f:
-        # begin the log by printing this file (the Python code)
         f.write(str(cmd_args) + '\n')
+        # begin the log by printing this file (the Python code)
         f.write('='*100 + '\n')
         f.write(code)
         f.write('='*100 + '\n')
@@ -775,8 +819,10 @@ for step in range(args.num_iterations + 1):
             loss.backward() # just sync on the last step
     for p in model.parameters():
         p.grad /= train_accumulation_steps
+    # momentum warmup for Muon
+    frac = min(step/500, 1)
+    optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
-
     lr = []
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
